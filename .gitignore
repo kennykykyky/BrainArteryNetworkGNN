@@ -1,0 +1,23 @@
+# Exclude all data files
+*.csv
+*.pth
+*.npy
+*.xlsx
+*.h5
+*.hdf5
+*.log
+
+# Exclude all cache folders and system files
+__pycache__/
+*.py[cod]
+*.DS_Store
+*.swp
+*.swo
+*.bak
+*.tmp
+*.temp
+
+# Exclude a specific folder
+tmp/
+examples/datasets/
+examples/exp/
