@@ -101,40 +101,39 @@ class GAT(torch.nn.Module):
             gat_input_dim = hidden_dim
             self.convs.append(conv)
 
-        input_dim = 0
-
         if self.pooling == "concat":
-            node_dim = 8
+            node_dim = hidden_dim // 4  # Scale based on hidden_dim
             conv = torch_geometric.nn.Sequential('x, edge_index, edge_attr', [
                 (MPGATConv(hidden_dim, hidden_dim, heads=num_heads, dropout=dropout,
                                  gat_mp_type=gat_mp_type, edge_attr_size=args.edge_attr_size),'x, edge_index, edge_attr -> x'),
-                nn.Linear(hidden_dim*num_heads, 64),
+                nn.Linear(hidden_dim*num_heads, hidden_dim),
                 nn.LeakyReLU(negative_slope=0.2),
-                nn.Linear(64, node_dim),
+                nn.Linear(hidden_dim, node_dim),
                 nn.LeakyReLU(negative_slope=0.2),
                 nn.BatchNorm1d(node_dim)
             ])
             input_dim = node_dim*num_nodes
 
         elif self.pooling == 'sum' or self.pooling == 'mean':
-            node_dim = 256
+            node_dim = hidden_dim  # Use the provided hidden_dim
             input_dim = node_dim
             conv = torch_geometric.nn.Sequential('x, edge_index, edge_attr', [
                 (MPGATConv(hidden_dim, hidden_dim, heads=num_heads, dropout=dropout,
                                  gat_mp_type=gat_mp_type, edge_attr_size=args.edge_attr_size),'x, edge_index, edge_attr -> x'),
-                nn.Linear(hidden_dim* num_heads, hidden_dim),
+                nn.Linear(hidden_dim*num_heads, node_dim),
                 nn.LeakyReLU(negative_slope=0.2),
                 nn.BatchNorm1d(node_dim)
             ])
 
         self.convs.append(conv)
 
+        # Final MLP layers scaled based on input_dim
         self.fcn = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, hidden_dim),
             nn.LeakyReLU(negative_slope=0.2),
-            nn.Linear(256, 32),
+            nn.Linear(hidden_dim, hidden_dim//2),
             nn.LeakyReLU(negative_slope=0.2),
-            nn.Linear(32, num_classes)
+            nn.Linear(hidden_dim//2, num_classes)
         )
 
     def forward(self, x, edge_index, edge_attr, batch):

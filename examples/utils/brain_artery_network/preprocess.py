@@ -244,7 +244,8 @@ def save_data_as_npy(graph_data, atlas_name, metadata_file, save_path=None):
         # site = id2site.get(int(subject_id), None)  # Get the site ID
         # label = metadata.loc[metadata["ID"]==sub_id, "Gender"].values[0]
         # label = metadata.loc[metadata["ID"]==sub_id, "Diabetes"].values[0]
-        label = metadata.loc[metadata["ID"]==sub_id, "Risk_category"].values[0]
+        # label = metadata.loc[metadata["ID"]==sub_id, "Risk_category"].values[0]
+        label = metadata.loc[metadata["ID"]==sub_id, "Framingham_Risk"].values[0] / 100
 
         # Append data to respective lists
         connectivity_matrices.append(connectivity_matrix)
@@ -311,14 +312,14 @@ def save_data_as_npy(graph_data, atlas_name, metadata_file, save_path=None):
 
 # Path to your folder containing the GEXF files
 data_folder = '/home/kaiyu/research/VesselSeg/data/multiclass_lumen/graphs'
-metadata_file = '/home/kaiyu/research/git_repos/BrainGB/examples/datasets/BrainVasculature/Formal_CROP-BRAVE-IPH-SKDementia_DemoClin.csv'  # Path to your metadata CSV file
+metadata_file = '/home/kaiyu/research/git_repos/BrainArteryNetworkGNN/examples/datasets/BrainVasculature/Formal_CROP-BRAVE-IPH-SKDementia_DemoClin.csv'  # Path to your metadata CSV file
 
 # can generate different subset of data
 atlas_names = ['BRAVE', 'CROP', 'Dementia']  # Specify the dataset or atlas name
 # dataset_name = "BrainVasculature"  # Specify the dataset name
-dataset_name = "BrainVasculature_Framingham"  # Specify the dataset name
-# save_path = '/home/kaiyu/research/git_repos/BrainGB/examples/datasets/BrainVasculature'
-save_path = '/home/kaiyu/research/git_repos/BrainGB/examples/datasets/BrainVasculature_Framingham'
+dataset_name = "BrainVasculature_FraminghamScore"  # Specify the dataset name
+# save_path = '/home/kaiyu/research/git_repos/BrainArteryNetworkGNN/examples/datasets/BrainVasculature'
+save_path = '/home/kaiyu/research/git_repos/BrainArteryNetworkGNN/examples/datasets/BrainVasculature_FraminghamScore'
 
 os.makedirs(save_path, exist_ok=True)
 

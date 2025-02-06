@@ -8,6 +8,7 @@ def main():
     parser.add_argument('--target', type=str, required=True, help='Target script to run')
     parser.add_argument('--enable_nni', action='store_true', help='Enable NNI')
     parser.add_argument('--dataset', type=str, required=True, help='Dataset name')
+    parser.add_argument('--regression', action='store_true', help='Enable regression')
     args = parser.parse_args()
 
     # Set the PYTHONPATH to include the parent directory of 'examples'
@@ -24,6 +25,8 @@ def main():
     command = f'python -m examples.{target_module} --dataset {args.dataset}'
     if args.enable_nni:
         command += ' --enable_nni'
+    if args.regression:
+        command += ' --regression'
 
     # Print the constructed command for debugging
     print(f"Running command: {command}")

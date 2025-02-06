@@ -1,0 +1,62 @@
+{
+    "model_name": {
+        "_type": "choice",
+        "_value": ["gat"]
+    },
+    "lr": {
+        "_type": "choice",
+        "_value": [1e-4, 1e-5]
+    },
+    "n_GNN_layers": {
+        "_type": "choice",
+        "_value": [1, 2]
+    },
+    "n_MLP_layer": {
+        "_type": "choice",
+        "_value": [1, 2, 3, 4]
+    },
+    "initial_epochs": {
+        "_type": "choice",
+        "_value": [200, 500]
+    },
+    "weight_decay": {
+        "_type": "choice",
+        "_value": [1e-5, 1e-4, 1e-3]
+    },
+    "edge_emb_dim": {
+        "_type": "choice",
+        "_value": [64,128,256]
+    },
+    "num_heads": {
+        "_type": "choice",
+        "_value": [1, 2, 4]
+    },
+    "dropout": {
+        "_type": "choice",
+        "_value": [0.3, 0.6, 0.8]
+    },
+    "train_batch_size": {
+        "_type": "choice",
+        "_value": [16, 32]
+    },
+    "gat_mp_type": {
+        "_type": "choice",
+        "_value": ["attention_weighted", "attention_edge_weighted", "sum_attention_edge", "edge_node_concate"]
+    },
+    "gat_hidden_dim": {
+        "_type": "choice",
+        "_value": [8, 16, 64]
+    },
+    "hidden_dim": {
+        "_type": "choice",
+        "_value": [32, 128, 256, 512]
+    },
+    "k_fold_splits": {
+        "_type": "choice",
+        "_value": [2]
+    },
+    "pooling": {
+        "_type": "choice",
+        "_value": ["mean", "concat", "sum"]
+    }
+}

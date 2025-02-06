@@ -17,4 +17,7 @@ def build_model(args, device, model_name, num_features, num_nodes, n_classes=2):
                       ).to(device)
     else:
         raise ValueError(f"ERROR: Model variant \"{args.variant}\" not found!")
+    # check if model has regression
+    if hasattr(args, 'regression') and args.regression:
+        model.regression = True
     return model

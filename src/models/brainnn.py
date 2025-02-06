@@ -12,10 +12,14 @@ class BrainNN(torch.nn.Module):
         self.gnn = gnn
         self.pooling = args.pooling
         self.discriminator = discriminator
+        self.regression = getattr(args, 'regression', False)
 
     def forward(self, data):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         g = self.gnn(x, edge_index, edge_attr, batch)
-        log_logits = F.log_softmax(g, dim=-1)
         
-        return log_logits
+        if not self.regression:
+            # For classification, apply log_softmax
+            g = F.log_softmax(g, dim=-1)
+        # For regression (FRS prediction), return raw logits for BCE with logits
+        return g

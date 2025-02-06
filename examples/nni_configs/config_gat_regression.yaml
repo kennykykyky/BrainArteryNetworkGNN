@@ -1,0 +1,18 @@
+experimentName: BrainVasculature_FraminghamScore
+searchSpaceFile: search_space_regression.json
+trialCommand: python run.py --target example_main_regression.py --regression --enable_nni --dataset BrainVasculature_FraminghamScore
+trialCodeDirectory: /home/kaiyu/research/git_repos/BrainArteryNetworkGNN/examples/
+experimentWorkingDirectory: /home/kaiyu/research/git_repos/BrainArteryNetworkGNN/nni_experiments
+trialGpuNumber: 1  # Each trial uses 1 GPU
+trialConcurrency: 8  # Total number of concurrent trials
+maxExperimentDuration: 48h
+maxTrialNumber: 9000
+tuner:
+  name: TPE
+  classArgs:
+    optimize_mode: maximize  # Optimize for R² score
+trainingService:
+  platform: local
+  useActiveGpu: true
+  maxTrialNumberPerGpu: 2  # Allow 8 trials per GPU
+  gpuIndices: [0,1,2,3]

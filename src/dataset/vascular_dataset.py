@@ -186,7 +186,11 @@ class VascularDataset(InMemoryDataset):
         # if self.name in ['BRAVE', 'SKDementia', 'CROP', 'IPH', 'BRAINVASCULATURE']:
         if self.name:
             adj, edge_features, node_features, y = load_data(self.raw_dir)
-            y = torch.LongTensor(y)
+            # check if y is a array with float64
+            if y.dtype == np.float64:
+                y = torch.tensor(y, dtype=torch.float)
+            else:
+                y = torch.LongTensor(y)
             adj = torch.Tensor(adj)
             num_graphs = adj.shape[0]
             num_nodes = adj.shape[1]

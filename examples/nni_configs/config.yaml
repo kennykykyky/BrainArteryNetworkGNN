@@ -1,9 +1,10 @@
 experimentName: BrainVasculature_HPT
 searchSpaceFile: search_space.json
 trialCommand: python run.py --target example_main_BRAVE.py --enable_nni --dataset BrainVasculature_Framingham
-trialCodeDirectory: /home/kaiyu/research/git_repos/BrainGB/examples/
-trialGpuNumber: 4
-trialConcurrency: 16
+trialCodeDirectory: /home/kaiyu/research/git_repos/BrainArteryNetworkGNN/examples/
+experimentWorkingDirectory: /home/kaiyu/research/git_repos/BrainArteryNetworkGNN/nni_experiments
+trialGpuNumber: 1
+trialConcurrency: 8
 maxExperimentDuration: 24h
 maxTrialNumber: 9000
 tuner:
@@ -13,4 +14,5 @@ tuner:
 trainingService:
   platform: local
   useActiveGpu: True
+  maxTrialNumberPerGpu: 2  # Allow 8 trials per GPU
   gpuIndices: [0,1,2,3]
