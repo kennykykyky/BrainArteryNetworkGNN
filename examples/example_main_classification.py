@@ -8,7 +8,7 @@ import argparse
 import sys
 import numpy as np
 import torch
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, KFold
 from torch_geometric.loader import DataLoader
 import nni
 import os
@@ -19,7 +19,7 @@ import pdb
 
 from src.dataset import VascularDataset
 from src.dataset.maskable_list import MaskableList
-from src.utils import calculate_bin_edges, get_y
+from src.utils import get_y
 # from train_and_evaluate import train_and_evaluate, evaluate
 from .train_and_evaluate import train_and_evaluate, evaluate
 
@@ -42,26 +42,25 @@ def main(args):
 
     # init model
     model_name = str(args.model_name).lower()
-    # seed_everything(args.seed) # use args.seed for each run
+    seed_everything(args.seed) # use args.seed for each run
     device = torch.device(f'cuda:{args.device_number}' if torch.cuda.is_available() else 'cpu')
     self_dir = os.path.dirname(os.path.realpath(__file__))
 
-    if args.dataset_name == 'BRAVE':  # ABCD dataset puts files in a separate directory
-        root_dir = os.path.join(self_dir, 'datasets/BRAVE/')
-    elif args.dataset_name == 'BrainVasculature':
-        root_dir = os.path.join(self_dir, 'datasets/BrainVasculature/')
-    elif args.dataset_name == 'ABIDE':
-        root_dir = os.path.join(self_dir, 'datasets/ABIDE/')
+    # Set up dataset paths
+    root_dir = os.path.join(self_dir, 'datasets/BrainVasculature')
+    if args.dataset_name:
+        dataset_name = args.dataset_name
     else:
-        root_dir = os.path.join(self_dir, 'datasets/', args.dataset_name)
+        dataset_name = 'BrainVasculature_Gender'  # Default to gender classification
         
-    # if there are modifications to the dataset, you should delete the .pt file and rerun the code
     dataset = VascularDataset(root=root_dir,
-                           name=args.dataset_name,
-                           pre_transform=get_transform(args.node_features) if args.node_features is not None else None,)
+                           name=dataset_name,
+                           pre_transform=get_transform(args.node_features) if args.node_features is not None else None)    
+        
     y = get_y(dataset)
-    n_classes = len(np.unique(y))
+    num_classes = len(np.unique(y))
     num_features = dataset[0].x.shape[1]
+    num_edge_features = dataset[0].edge_attr.shape[1]  # Updated to include vessel type encoding
     nodes_num = dataset.num_nodes
     # if args.model_name == 'gcn':
     #     bin_edges = calculate_bin_edges(dataset, num_bins=args.bucket_num)
@@ -73,13 +72,18 @@ def main(args):
     best_acc_model, best_auc_model, best_macro_model = None, None, None
 
     for _ in range(args.repeat):
-        seed_everything(random.randint(1, 1000000))  # use random seed for each run
-        skf = StratifiedKFold(n_splits=args.k_fold_splits, shuffle=True)
-        for train_index, test_index in skf.split(dataset, y):
-            model = build_model(args, device, model_name, num_features, nodes_num, n_classes=n_classes)
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            train_set, test_set = dataset[train_index], dataset[test_index]
+        # seed_everything(random.randint(1, 1000000))  # use random seed for each run
+        kf = KFold(n_splits=args.k_fold_splits, shuffle=True, random_state=args.seed)
+        for train_index, test_index in kf.split(dataset):
+            model = build_model(args, device, model_name, num_features, nodes_num, num_edge_features=num_edge_features, n_classes=num_classes)
+            
+            # Use AdamW optimizer with decoupled weight decay if specified
+            if args.optimizer == 'adamw':
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            else:
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+            train_set, test_set = dataset[train_index], dataset[test_index]
             train_loader = DataLoader(train_set, batch_size=args.train_batch_size, shuffle=False)
             test_loader = DataLoader(test_set, batch_size=args.test_batch_size, shuffle=False)
 
@@ -107,7 +111,12 @@ def main(args):
                 best_macro_model = model.state_dict()
 
     if args.enable_nni:
-        nni.report_final_result(np.max(aucs))
+        nni.report_final_result({
+            'default': np.mean(aucs),  # Primary metric
+            'auc': np.mean(aucs),
+            'micro_f1': np.mean(accs),
+            'macro_f1': np.mean(macros)
+        })
 
     ## create a log folder under exp/ and save the model, as well as the training log file
     os.makedirs('exp/log', exist_ok=True)
@@ -165,9 +174,8 @@ def count_degree(data: np.ndarray):  # data: (sample, node, node)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_name', type=str,
-                        # choices=['PPMI', 'HIV', 'BP', 'ABCD', 'PNC', 'ABIDE'],
-                        default="BP")
+    parser.add_argument('--dataset_name', type=str, default=None,
+                        help='BrainVasculature_GENDER, BrainVasculature_DIABETES, or BrainVasculature_SMOKING')
     parser.add_argument('--view', type=int, default=1)
     parser.add_argument('--node_features', type=str,
                         choices=['identity', 'degree', 'degree_bin', 'LDP', 'node2vec', 'adj', 'diff_matrix',
@@ -175,32 +183,32 @@ if __name__ == "__main__":
                         default=None)
     parser.add_argument('--pooling', type=str,
                         choices=['sum', 'concat', 'mean'],
-                        default='sum')
+                        default='mean')
                         
-    parser.add_argument('--model_name', type=str, default='gcn')
+    parser.add_argument('--model_name', type=str, default='gat')
     # gcn_mp_type choices: weighted_sum, bin_concate, edge_weight_concate, edge_node_concate, node_concate
-    parser.add_argument('--gcn_mp_type', type=str, default="bin_concate") 
+    parser.add_argument('--gcn_mp_type', type=str, default="node_concate") 
     # gat_mp_type choices: attention_weighted, attention_edge_weighted, sum_attention_edge, edge_node_concate, node_concate
     parser.add_argument('--gat_mp_type', type=str, default="attention_edge_weighted") 
 
     parser.add_argument('--enable_nni', action='store_true')
     parser.add_argument('--n_GNN_layers', type=int, default=2)
     parser.add_argument('--n_MLP_layers', type=int, default=1)
-    parser.add_argument('--num_heads', type=int, default=1)
-    parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--gat_hidden_dim', type=int, default=8)
-    parser.add_argument('--edge_emb_dim', type=int, default=256)
+    parser.add_argument('--num_heads', type=int, default=2)
+    parser.add_argument('--hidden_dim', type=int, default=64)
+    parser.add_argument('--gat_hidden_dim', type=int, default=4)
+    parser.add_argument('--edge_emb_dim', type=int, default=64)
     parser.add_argument('--edge_attr_size', type=int, default=2)
     parser.add_argument('--bucket_sz', type=float, default=0.05)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-3)
-    parser.add_argument('--dropout', type=float, default=0.7)
+    parser.add_argument('--dropout', type=float, default=0.3)
 
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--k_fold_splits', type=int, default=2)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--test_interval', type=int, default=5)
-    parser.add_argument('--train_batch_size', type=int, default=16)
+    parser.add_argument('--train_batch_size', type=int, default=4)
     parser.add_argument('--test_batch_size', type=int, default=1)
 
     parser.add_argument('--seed', type=int, default=112078)
@@ -208,4 +216,14 @@ if __name__ == "__main__":
     parser.add_argument('--mixup', type=int, default=0) #[0, 1]
     parser.add_argument('--device_number', type=int, default=0)  # Add this line
 
-    main(parser.parse_args())
+    # Add new parameters matching regression version
+    parser.add_argument('--optimizer', type=str, choices=['adam', 'adamw'], default='adamw')
+    parser.add_argument('--lr_schedule', type=str, choices=['none', 'cosine', 'onecycle'], default='cosine')
+    parser.add_argument('--min_lr', type=float, default=1e-6)
+    parser.add_argument('--use_huber', action='store_true')
+    parser.add_argument('--huber_delta', type=float, default=1.0)
+    parser.add_argument('--clip_grad', action='store_true')
+    parser.add_argument('--clip_value', type=float, default=1.0)
+
+    args = parser.parse_args()
+    main(args)

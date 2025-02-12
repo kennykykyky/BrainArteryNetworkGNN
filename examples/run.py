@@ -9,6 +9,8 @@ def main():
     parser.add_argument('--enable_nni', action='store_true', help='Enable NNI')
     parser.add_argument('--dataset', type=str, required=True, help='Dataset name')
     parser.add_argument('--regression', action='store_true', help='Enable regression')
+    parser.add_argument('--use_huber', action='store_true', help='Use Huber loss')
+    parser.add_argument('--clip_grad', action='store_true', help='Clip gradients')
     args = parser.parse_args()
 
     # Set the PYTHONPATH to include the parent directory of 'examples'
@@ -27,6 +29,10 @@ def main():
         command += ' --enable_nni'
     if args.regression:
         command += ' --regression'
+    if args.use_huber:
+        command += ' --use_huber'
+    if args.clip_grad:
+        command += ' --clip_grad'
 
     # Print the constructed command for debugging
     print(f"Running command: {command}")

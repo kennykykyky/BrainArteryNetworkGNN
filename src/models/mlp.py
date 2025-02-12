@@ -17,6 +17,7 @@ class MLP(torch.nn.Module):
             self.classifier = torch.nn.Linear(hidden_dim, n_classes)
 
     def forward(self, x):
+        import pdb; pdb.set_trace()
         out = self.net(x) + self.shortcut(x)
         if hasattr(self, 'classifier'):
             return out, self.classifier(out)

@@ -15,11 +15,13 @@ import logging
 import pdb
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from torch_geometric.transforms import Compose
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
 
 from src.dataset import VascularDataset
 from src.dataset.maskable_list import MaskableList
 from src.utils import get_y
-# from train_and_evaluate import train_and_evaluate, evaluate
 from .train_and_evaluate import train_and_evaluate, evaluate
 
 
@@ -30,57 +32,146 @@ def seed_everything(seed):
     np.random.seed(seed)  # set random seed for numpy
     torch.manual_seed(seed)  # set random seed for CPU
     torch.cuda.manual_seed_all(seed)  # set random seed for all GPUs
+    torch.backends.cudnn.deterministic = True  # for reproducibility
 
 
 def main(args):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
     
     if args.enable_nni:
-        # pdb.set_trace()
         args = ModifiedArgs(args, nni.get_next_parameter())
 
     # init model
     model_name = str(args.model_name).lower()
-    # seed_everything(args.seed) # use args.seed for each run
+    seed_everything(args.seed)
     device = torch.device(f'cuda:{args.device_number}' if torch.cuda.is_available() else 'cpu')
     self_dir = os.path.dirname(os.path.realpath(__file__))
 
-    if args.dataset_name == 'BRAVE':  # ABCD dataset puts files in a separate directory
-        root_dir = os.path.join(self_dir, 'datasets/BRAVE/')
-    elif args.dataset_name == 'BrainVasculature':
-        root_dir = os.path.join(self_dir, 'datasets/BrainVasculature/')
-    elif args.dataset_name == 'ABIDE':
-        root_dir = os.path.join(self_dir, 'datasets/ABIDE/')
+    # Set up dataset paths
+    root_dir = os.path.join(self_dir, 'datasets/BrainVasculature')
+    if args.dataset_name:
+        dataset_name = args.dataset_name
     else:
-        root_dir = os.path.join(self_dir, 'datasets/', args.dataset_name)
+        dataset_name = 'BrainVasculature_Gender'
         
     dataset = VascularDataset(root=root_dir,
-                           name=args.dataset_name,
-                           pre_transform=get_transform(args.node_features) if args.node_features is not None else None,)    
-        
+                           name=dataset_name,
+                           pre_transform=get_transform(args.node_features) if args.node_features is not None else None)   
+    
+    # Log original age values without normalization
+    y_values = np.array([data.y.item() for data in dataset])
+    logging.info(f"\nOriginal target values:")
+    logging.info(f"Range: [{y_values.min():.2f}, {y_values.max():.2f}]")
+    logging.info(f"Mean: {np.mean(y_values):.2f}")
+    logging.info(f"Std: {np.std(y_values):.2f}")
+    
+    # Store original values for verification
+    dataset.original_values = y_values.copy()
+    
     y = get_y(dataset)
     num_features = dataset[0].x.shape[1]
+    num_edge_features = dataset[0].edge_attr.shape[1]
     nodes_num = dataset.num_nodes
-    # if args.model_name == 'gcn':
-    #     bin_edges = calculate_bin_edges(dataset, num_bins=args.bucket_num)
-    # else:
-    #     bin_edges = None
 
     mses, maes, r2s = [], [], []
     best_mse, best_mae, best_r2 = float('inf'), float('inf'), float('-inf')
     best_mse_model, best_mae_model, best_r2_model = None, None, None
 
     for _ in range(args.repeat):
-        seed_everything(random.randint(1, 1000000))  # use random seed for each run
-        kf = KFold(n_splits=args.k_fold_splits, shuffle=True)
-        for train_index, test_index in kf.split(dataset):
-            model = build_model(args, device, model_name, num_features, nodes_num, n_classes=1)  # Changed to 1 output for regression
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            train_set, test_set = dataset[train_index], dataset[test_index]
-
-            train_loader = DataLoader(train_set, batch_size=args.train_batch_size, shuffle=False)
+        # Use fixed random state for reproducible splits
+        kf = KFold(n_splits=args.k_fold_splits, shuffle=True, random_state=args.seed)
+        for fold_idx, (train_index, test_index) in enumerate(kf.split(dataset)):
+            exp_name = f'{args.dataset_name}_{args.model_name}_fold_{fold_idx}'
+            
+            # Get train/test sets before normalization
+            train_set = [data for data in dataset[train_index]]  # Convert to list of Data objects
+            test_set = [data for data in dataset[test_index]]    # Convert to list of Data objects
+            
+            # Store original values before normalization
+            train_y_values = np.array([data.y.item() for data in train_set])
+            test_y_values = np.array([data.y.item() for data in test_set])
+            
+            # Calculate min-max normalization parameters using only training data
+            train_y_min = np.min(train_y_values)
+            train_y_max = np.max(train_y_values)
+            
+            logging.info(f"\nFold {fold_idx} - Training set statistics before normalization:")
+            logging.info(f"Min: {train_y_min:.2f}, Max: {train_y_max:.2f}")
+            logging.info(f"Mean: {np.mean(train_y_values):.2f}")
+            logging.info(f"Std: {np.std(train_y_values):.2f}")
+            
+            # Create deep copies and normalize the data
+            normalized_train_set = []
+            normalized_test_set = []
+            
+            for data in train_set:
+                data_copy = data.clone()
+                data_copy.y_original = data_copy.y.clone()
+                normalized_value = (data_copy.y.item() - train_y_min) / (train_y_max - train_y_min)
+                data_copy.y = torch.tensor([normalized_value], dtype=torch.float)
+                normalized_train_set.append(data_copy)
+            
+            for data in test_set:
+                data_copy = data.clone()
+                data_copy.y_original = data_copy.y.clone()
+                normalized_value = (data_copy.y.item() - train_y_min) / (train_y_max - train_y_min)
+                data_copy.y = torch.tensor([normalized_value], dtype=torch.float)
+                normalized_test_set.append(data_copy)
+            
+            # Create new MaskableList objects with the normalized data
+            train_set = MaskableList(normalized_train_set)
+            test_set = MaskableList(normalized_test_set)
+            
+            # Add denormalization method to both sets
+            def create_denormalize(min_val, max_val):
+                def denormalize(normalized_values):
+                    if isinstance(normalized_values, torch.Tensor):
+                        normalized_values = normalized_values.numpy()
+                    return normalized_values * (max_val - min_val) + min_val
+                return denormalize
+            
+            train_set.denormalize = create_denormalize(train_y_min, train_y_max)
+            test_set.denormalize = create_denormalize(train_y_min, train_y_max)
+            
+            # Store normalization parameters
+            train_set.y_min = train_y_min
+            train_set.y_max = train_y_max
+            test_set.y_min = train_y_min
+            test_set.y_max = train_y_max
+            
+            # Store original values
+            train_set.original_values = train_y_values
+            test_set.original_values = test_y_values
+            
+            # Log normalized values statistics
+            train_normalized = np.array([data.y.item() for data in train_set])
+            test_normalized = np.array([data.y.item() for data in test_set])
+            logging.info(f"\nNormalized values statistics:")
+            logging.info(f"Train - Range: [{train_normalized.min():.4f}, {train_normalized.max():.4f}]")
+            logging.info(f"Test - Range: [{test_normalized.min():.4f}, {test_normalized.max():.4f}]")
+            
+            # Verify normalization
+            logging.info(f"\nVerification:")
+            logging.info(f"Original train range: [{train_y_values.min():.2f}, {train_y_values.max():.2f}]")
+            logging.info(f"Original test range: [{test_y_values.min():.2f}, {test_y_values.max():.2f}]")
+            denormalized_train = train_set.denormalize(train_normalized)
+            denormalized_test = test_set.denormalize(test_normalized)
+            logging.info(f"Denormalized train range: [{denormalized_train.min():.2f}, {denormalized_train.max():.2f}]")
+            logging.info(f"Denormalized test range: [{denormalized_test.min():.2f}, {denormalized_test.max():.2f}]")
+            
+            # Create data loaders
+            train_loader = DataLoader(train_set, batch_size=args.train_batch_size, shuffle=True)
             test_loader = DataLoader(test_set, batch_size=args.test_batch_size, shuffle=False)
-
+            
+            # Build model and continue with training
+            model = build_model(args, device, model_name, num_features, nodes_num, num_edge_features=num_edge_features, n_classes=1)
+            
+            # Use AdamW optimizer with decoupled weight decay
+            if args.optimizer == 'adamw':
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            else:
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            
             # train
             test_mse, test_mae, test_r2 = train_and_evaluate(model, train_loader, test_loader,
                                                           optimizer, device, args)
@@ -114,34 +205,25 @@ def main(args):
                 best_r2_model = model.state_dict()
 
     if args.enable_nni:
-        # Report all metrics to NNI
         nni.report_final_result({
-            'default': np.mean(r2s),  # Primary metric (R²)
+            'default': np.mean(r2s),
             'r2': np.mean(r2s),
             'mse': np.mean(mses),
             'mae': np.mean(maes)
         })
 
-    ## create a log folder under exp/ and save the model, as well as the training log file
+    ## create a log folder under exp/ and save the model
     os.makedirs('exp/log', exist_ok=True)
-    # name the current experiement with the current time
     exp_name = f'{args.dataset_name}_{args.model_name}_{args.node_features}_{args.pooling}_{args.gcn_mp_type}_{args.gat_mp_type}_{args.num_heads}_{args.hidden_dim}_{args.gat_hidden_dim}_{args.edge_emb_dim}_{args.lr}_{args.weight_decay}_{args.dropout}_{args.seed}_{args.mixup}'   
     os.makedirs(f'exp/log/{exp_name}', exist_ok=True)
-    # save the last model
-    torch.save(model.state_dict(), f'exp/log/{exp_name}/model.pth')
-    # save the training log
-    with open(f'exp/log/{exp_name}/training.log', 'w') as f:
-        f.write(f'(K Fold Final Result)| avg_mse={np.mean(mses):.4f} +- {np.std(mses):.4f}, '
-                f'avg_mae={np.mean(maes):.4f} +- {np.std(maes):.4f}, '
-                f'avg_r2={np.mean(r2s):.4f} +- {np.std(r2s):.4f}\n')
     
-    # Save the best models
+    # save models
+    torch.save(model.state_dict(), f'exp/log/{exp_name}/model.pth')
     torch.save(best_mse_model, f'exp/log/{exp_name}/best_mse_model.pth')
     torch.save(best_mae_model, f'exp/log/{exp_name}/best_mae_model.pth')
     torch.save(best_r2_model, f'exp/log/{exp_name}/best_r2_model.pth')    
     
-    # plot the test results using matplotlib
-    import matplotlib.pyplot as plt
+    # plot the test results
     plt.figure(figsize=(12, 4))
     
     plt.subplot(131)
@@ -174,27 +256,18 @@ def main(args):
     print("seed for main(): ", args.seed)
 
     with open('result.log', 'a') as f:
-        # write all input arguments to f
         input_arguments: List[str] = sys.argv
         f.write(f'{input_arguments}\n')
         f.write(result_str + '\n')
-        # write all logging info to f
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', handlers=[logging.FileHandler('result.log', 'a')])
-        
-
-def count_degree(data: np.ndarray):  # data: (sample, node, node)
-    count = np.zeros((data.shape[1], data.shape[1]))
-    for i in range(data.shape[1]):
-        count[i, :] = np.sum(data[:, i, :] != 0, axis=0)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name', type=str,
-                        # choices=['PPMI', 'HIV', 'BP', 'ABCD', 'PNC', 'ABIDE'],
-                        default="BP")
+                        default="BrainVasculature_AGE")
     parser.add_argument('--view', type=int, default=1)
     parser.add_argument('--node_features', type=str,
                         choices=['identity', 'degree', 'degree_bin', 'LDP', 'node2vec', 'adj', 'diff_matrix',
@@ -205,38 +278,42 @@ if __name__ == "__main__":
                         default='mean')
                         
     parser.add_argument('--model_name', type=str, default='gat')
-    # gcn_mp_type choices: weighted_sum, bin_concate, edge_weight_concate, edge_node_concate, node_concate
     parser.add_argument('--gcn_mp_type', type=str, default="node_concate") 
-    # gat_mp_type choices: attention_weighted, attention_edge_weighted, sum_attention_edge, edge_node_concate, node_concate
     parser.add_argument('--gat_mp_type', type=str, default="attention_edge_weighted") 
 
     parser.add_argument('--enable_nni', action='store_true')
     parser.add_argument('--n_GNN_layers', type=int, default=2)
-    parser.add_argument('--n_MLP_layers', type=int, default=1)
-    parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument('--hidden_dim', type=int, default=512)
-    parser.add_argument('--gat_hidden_dim', type=int, default=32)
-    parser.add_argument('--edge_emb_dim', type=int, default=128)
+    parser.add_argument('--n_MLP_layers', type=int, default=2)
+    parser.add_argument('--num_heads', type=int, default=2)
+    parser.add_argument('--hidden_dim', type=int, default=32)
+    parser.add_argument('--gat_hidden_dim', type=int, default=4)
+    parser.add_argument('--edge_emb_dim', type=int, default=64)
     parser.add_argument('--edge_attr_size', type=int, default=2)
     parser.add_argument('--bucket_sz', type=float, default=0.05)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=5e-3)
-    parser.add_argument('--dropout', type=float, default=0.7)
+    parser.add_argument('--dropout', type=float, default=0.3)
 
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--k_fold_splits', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--test_interval', type=int, default=5)
-    parser.add_argument('--train_batch_size', type=int, default=16)
+    parser.add_argument('--train_batch_size', type=int, default=4)
     parser.add_argument('--test_batch_size', type=int, default=1)
 
-    parser.add_argument('--seed', type=int, default=112078)
+    parser.add_argument('--seed', type=int, default=1301)
     parser.add_argument('--diff', type=float, default=0.2)
-    parser.add_argument('--mixup', type=int, default=0) #[0, 1]
-    parser.add_argument('--device_number', type=int, default=0)  # Add this line
+    parser.add_argument('--mixup', type=int, default=0)
+    parser.add_argument('--device_number', type=int, default=0)
 
-    # Add regression flag
-    parser.add_argument('--regression', action='store_true', help='Whether to perform regression instead of classification')
+    parser.add_argument('--regression', action='store_true')
+    parser.add_argument('--optimizer', type=str, choices=['adam', 'adamw'], default='adamw')
+    parser.add_argument('--lr_schedule', type=str, choices=['none', 'cosine', 'onecycle'], default='cosine')
+    parser.add_argument('--min_lr', type=float, default=1e-6)
+    parser.add_argument('--use_huber', action='store_true')
+    parser.add_argument('--huber_delta', type=float, default=1.0)
+    parser.add_argument('--clip_grad', action='store_true')
+    parser.add_argument('--clip_value', type=float, default=1.0)
+    parser.add_argument('--weight_decay', type=float, default=5e-3)
+    parser.add_argument('--lr', type=float, default=1e-4)
 
     args = parser.parse_args()
     main(args)

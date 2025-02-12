@@ -21,3 +21,6 @@ __pycache__/
 tmp/
 examples/datasets/
 examples/exp/
+exp/
+nni_experiments/
+examples/nni_configs/

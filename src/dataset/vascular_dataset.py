@@ -2,6 +2,7 @@ import torch
 import os
 import numpy as np
 import os.path as osp
+import pickle
 
 from scipy.io import loadmat
 from torch_geometric.data import InMemoryDataset, Data
@@ -74,9 +75,26 @@ class VascularDataset(InMemoryDataset):
         self.view: int = view
         self.name = name.upper()
         self.filename_postfix = str(pre_transform) if pre_transform is not None else None
-        # assert self.name in ['BRAVE', 'SKDementia', 'CROP', 'IPH', 'BRAINVASCULATURE']
+        self.target_mean = None  # Store normalization parameters
+        self.target_std = None   # Store normalization parameters
         super(VascularDataset, self).__init__(root, transform, pre_transform)
-        self.data, self.slices, self.num_nodes = torch.load(self.processed_paths[0])
+        
+        # Load the processed data
+        try:
+            saved_dict = torch.load(self.processed_paths[0])
+            if isinstance(saved_dict, dict):
+                self.data = saved_dict['data']
+                self.slices = saved_dict['slices']
+                self.num_nodes = saved_dict['num_nodes']
+                self.target_mean = saved_dict['target_mean']
+                self.target_std = saved_dict['target_std']
+            else:
+                # Handle legacy format (tuple)
+                self.data, self.slices, self.num_nodes, self.target_mean, self.target_std = saved_dict
+        except Exception as e:
+            logging.error(f'Error loading dataset: {e}')
+            raise
+            
         self.pre_transform = pre_transform
         logging.info('Loaded dataset: {}'.format(self.name))
 
@@ -183,76 +201,141 @@ class VascularDataset(InMemoryDataset):
     #     torch.save((data, slices, num_nodes), self.processed_paths[0])
 
     def process(self):
-        # if self.name in ['BRAVE', 'SKDementia', 'CROP', 'IPH', 'BRAINVASCULATURE']:
         if self.name:
-            adj, edge_features, node_features, y = load_data(self.raw_dir)
-            # check if y is a array with float64
-            if y.dtype == np.float64:
-                y = torch.tensor(y, dtype=torch.float)
+            # Load the data using pickle
+            with open(os.path.join(self.raw_dir, f'{self.name}.npy'), 'rb') as f:
+                data_dict = pickle.load(f)
+            
+            # Extract the target variable based on the dataset name
+            target_mapping = {
+                'GENDER': ('gender', torch.long, False, False),           # Classification (not regression, not BCE)
+                'AGE': ('age', torch.float, True, False),               # Regression (normalize, not BCE)
+                'TC': ('total_cholesterol', torch.float, True, False),  # Regression (normalize, not BCE)
+                'LDL': ('ldl', torch.float, True, False),              # Regression (normalize, not BCE)
+                'HDL': ('hdl', torch.float, True, False),              # Regression (normalize, not BCE)
+                'SYSTOLICBP': ('sbp', torch.float, True, False),       # Regression (normalize, not BCE)
+                'DIABETES': ('diabetes', torch.long, False, False),      # Classification (not regression, not BCE)
+                'SMOKING': ('smoking', torch.long, False, False),        # Classification (not regression, not BCE)
+                'FRAMINGHAMSCORE': ('framingham_risk', torch.float, False, True),  # Already normalized, use BCE
+                'HYPERTENSION': ('hypertension', torch.long, False, False),  # Classification (not regression, not BCE)
+                'RISKCATEGORY': ('risk_category', torch.long, False, False)  # Classification (not regression, not BCE)
+            }
+            
+            # Extract target name from dataset name and convert to uppercase
+            target_name = self.name.split('_')[-1].upper()
+            if target_name in target_mapping:
+                var_name, dtype, _, use_bce = target_mapping[target_name]
+                y = torch.tensor(data_dict['clinical_variables'][var_name], dtype=dtype)
+                
+                # Store whether to use BCE loss
+                self.use_bce = use_bce
+                
+                # Remove normalization from here - it will be handled in main script
+                logging.info(f'Loaded {target_name} values without normalization')
             else:
-                y = torch.LongTensor(y)
-            adj = torch.Tensor(adj)
+                raise ValueError(f"Unknown target variable: {target_name}")
+            
+            adj = torch.Tensor(data_dict['connectivity'])
             num_graphs = adj.shape[0]
             num_nodes = adj.shape[1]
 
-        data_list = []
-        for i in range(num_graphs):
-            # Prepare edge index and edge attributes directly
-            edge_index = []
-            edge_attr = []
-            for edge_feature in edge_features[i]:
-                node1 = edge_feature["node1"]
-                node2 = edge_feature["node2"]
+            data_list = []
+            for i in range(num_graphs):
+                # Prepare edge index and edge attributes directly
+                edge_index = []
+                edge_attr = []
+                for edge_feature in data_dict['edge_features'][i]:
+                    node1 = edge_feature["node1"]
+                    node2 = edge_feature["node2"]
 
-                # Add edge index
-                edge_index.append([node1, node2])
-                edge_index.append([node2, node1])  # Since the graph is undirected
+                    # Add edge index
+                    edge_index.append([node1, node2])
+                    edge_index.append([node2, node1])  # Since the graph is undirected
 
-                # Add edge attributes (length, tortuosity, radius)
-                edge_attr.append([
-                    edge_feature["length"],
-                    edge_feature["tortuosity"],
-                ])
-                edge_attr.append([
-                    edge_feature["length"],
-                    edge_feature["tortuosity"],
-                ])  # Same for the reverse edge
+                    # Create edge features: [length, tortuosity, diameter, *vessel_type_onehot]
+                    edge_features = [
+                        float(edge_feature["length"]) if edge_feature["length"] is not None else 0.0,
+                        float(edge_feature["tortuosity"]) if edge_feature["tortuosity"] is not None else 0.0,
+                        float(edge_feature["diameter"]) if edge_feature["diameter"] is not None else 0.0,
+                    ]
+                    # # Extend with vessel type one-hot encoding
+                    # edge_features.extend([float(x) for x in edge_feature["ves_type"]])
+                    
+                    # Add the same features for both directions (undirected graph)
+                    edge_attr.append(edge_features)
+                    edge_attr.append(edge_features)
 
-            # Convert edge data to tensors
-            edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).T  # Shape [2, num_edges]
-            edge_attr_tensor = torch.tensor(edge_attr, dtype=torch.float)     # Shape [num_edges, num_features]
+                # Convert edge data to tensors
+                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).T  # Shape [2, num_edges]
+                edge_attr_tensor = torch.tensor(edge_attr, dtype=torch.float)     # Shape [num_edges, num_features]
 
-            # Prepare 3D positions as node features
-            node_pos = node_features[i]  # Assuming node_features[i] has shape (num_nodes, 3) for 3D positions
-            node_pos = torch.tensor(node_pos, dtype=torch.float)
+                # Prepare 3D positions as node features
+                node_pos = data_dict['node_coordinates'][i]  # Shape (num_nodes, 3) for 3D positions
+                node_pos = torch.tensor(node_pos, dtype=torch.float)
 
-            data = Data(num_nodes=num_nodes, y=y[i], edge_index=edge_index_tensor, edge_attr=edge_attr_tensor, pos=node_pos)
+                data = Data(num_nodes=num_nodes, y=y[i], edge_index=edge_index_tensor, edge_attr=edge_attr_tensor, pos=node_pos)
+                data.x = node_pos
+                data_list.append(data)
+
+            if self.pre_filter is not None:
+                data_list = [data for data in data_list if self.pre_filter(data)]
+
+            if self.pre_transform is not None:
+                data_list = [self.pre_transform(data) for data in data_list]
+            else:
+                data_list = [data for data in data_list]
+
+            data, slices = self.collate(data_list)
             
-            data.x = node_pos
-            data_list.append(data)
-
-        if self.pre_filter is not None:
-            data_list = [data for data in data_list if self.pre_filter(data)]
-
-        if self.pre_transform is not None:
-            data_list = [self.pre_transform(data) for data in data_list]
-        else:
-            data_list = [data for data in data_list]
-
-        data, slices = self.collate(data_list)
-        torch.save((data, slices, num_nodes), self.processed_paths[0])
+            # Save data in a consistent dictionary format
+            save_dict = {
+                'data': data,
+                'slices': slices,
+                'num_nodes': num_nodes,
+                'target_mean': self.target_mean,
+                'target_std': self.target_std
+            }
+            torch.save(save_dict, self.processed_paths[0])
 
     def _process(self):
         print('Processing...', file=sys.stderr)
 
         if files_exist(self.processed_paths):  # pragma: no cover
-            print('Done!', file=sys.stderr)
-            return
+            try:
+                # Load data with proper error handling
+                saved_dict = torch.load(self.processed_paths[0])
+                if isinstance(saved_dict, dict):
+                    self.data = saved_dict['data']
+                    self.slices = saved_dict['slices']
+                    self.num_nodes = saved_dict['num_nodes']
+                    self.target_mean = saved_dict['target_mean']
+                    self.target_std = saved_dict['target_std']
+                else:
+                    # Handle legacy format (tuple)
+                    self.data, self.slices, self.num_nodes, self.target_mean, self.target_std = saved_dict
+                print('Done!', file=sys.stderr)
+                return
+            except Exception as e:
+                print(f'Error loading processed file: {e}', file=sys.stderr)
+                # If loading fails, reprocess the data
+                pass
 
         os.makedirs(self.processed_dir, exist_ok=True)
         self.process()
 
         print('Done!', file=sys.stderr)
+
+    def denormalize(self, y):
+        """
+        Denormalize the predictions back to original scale.
+        Args:
+            y: normalized predictions
+        Returns:
+            denormalized predictions
+        """
+        if self.target_mean is not None and self.target_std is not None:
+            return y * self.target_std + self.target_mean
+        return y
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}{self.name}()'

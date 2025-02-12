@@ -7,7 +7,28 @@ from sklearn import metrics
 from typing import Optional
 from torch.utils.data import DataLoader
 import logging
+import os
 from src.utils import mixup, mixup_criterion
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR
+import matplotlib.pyplot as plt
+
+
+def setup_denorm_logger(exp_name):
+    """Set up a dedicated logger for denormalization verification"""
+    os.makedirs('exp/denorm_logs', exist_ok=True)
+    denorm_logger = logging.getLogger('denormalization')
+    denorm_logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers to avoid duplicate logging
+    if denorm_logger.hasHandlers():
+        denorm_logger.handlers.clear()
+    
+    # Create file handler
+    fh = logging.FileHandler(f'exp/denorm_logs/{exp_name}_denorm.log')
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
+    fh.setFormatter(formatter)
+    denorm_logger.addHandler(fh)
+    return denorm_logger
 
 
 def train_and_evaluate(model, train_loader, test_loader, optimizer, device, args):
@@ -15,18 +36,46 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, device, args
     accs, aucs, macros = [], [], []
     epoch_num = args.epochs
     
+    # Set up denormalization logger
+    exp_name = f"{args.dataset_name}_{args.model_name}"
+    denorm_logger = setup_denorm_logger(exp_name)
+    
+    # Initialize learning rate scheduler
+    if args.lr_schedule == 'cosine':
+        scheduler = CosineAnnealingLR(optimizer, T_max=epoch_num, eta_min=args.min_lr)
+    elif args.lr_schedule == 'onecycle':
+        scheduler = OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch_num, 
+                             steps_per_epoch=len(train_loader),
+                             pct_start=0.1)  # 10% warmup
+    
+    # Initialize Huber loss if specified
+    huber_loss = torch.nn.HuberLoss(delta=args.huber_delta) if args.use_huber else None
+    
+    # Track losses for analysis
+    train_losses = []
+    test_losses = []
+    train_metrics_history = []
+    test_metrics_history = []
+    
     for i in range(epoch_num):
-        loss_all = 0
+        model.train()
+        epoch_loss = 0
+        num_batches = 0
+        
         for data in train_loader:
             data = data.to(device)
             optimizer.zero_grad()
             
             if hasattr(model, 'regression') and model.regression:
-                # Soft classification mode (FRS prediction)
                 pred = model(data)
-                loss = F.binary_cross_entropy_with_logits(pred.view(-1), data.y.float())
+                
+                if hasattr(train_loader.dataset, 'use_bce') and train_loader.dataset.use_bce:
+                    loss = F.binary_cross_entropy_with_logits(pred.view(-1), data.y.float())
+                elif args.use_huber:
+                    loss = huber_loss(pred.view(-1), data.y.float())
+                else:
+                    loss = F.mse_loss(pred.view(-1), data.y.float())
             else:
-                # Original multi-class classification
                 if args.mixup:
                     data, y_a, y_b, lam = mixup(data, device=device)
                 out = model(data)
@@ -36,73 +85,113 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, device, args
                     loss = F.nll_loss(out, data.y)
             
             loss.backward()
-            optimizer.step()
-            loss_all += loss.item()
             
-        epoch_loss = loss_all / len(train_loader.dataset)
+            if args.clip_grad:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_value)
+                
+            optimizer.step()
+            
+            if args.lr_schedule == 'onecycle':
+                scheduler.step()
+                
+            epoch_loss += loss.item()
+            num_batches += 1
         
-        if hasattr(model, 'regression') and model.regression:
-            # Evaluate soft classification
-            train_metrics = evaluate(model, device, train_loader)
-            logging.info(f'(Train) | Epoch={i:03d}, loss={epoch_loss:.4f}, '
-                        f'MSE={train_metrics["mse"]:.4f}, '
-                        f'MAE={train_metrics["mae"]:.4f}, '
-                        f'R2={train_metrics["r2"]:.4f}')
-        else:
-            # Evaluate original classification
-            train_micro, train_auc, train_macro = evaluate(model, device, train_loader)
-            logging.info(f'(Train) | Epoch={i:03d}, loss={epoch_loss:.4f}, '
-                        f'train_micro={(train_micro * 100):.2f}, train_macro={(train_macro * 100):.2f}, '
-                        f'train_auc={(train_auc * 100):.2f}')
+        # Average training loss for the epoch
+        avg_train_loss = epoch_loss / num_batches
+        train_losses.append(avg_train_loss)
         
+        # Step the learning rate scheduler if using cosine
+        if args.lr_schedule == 'cosine':
+            scheduler.step()
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Log training metrics
+        model.eval()
+        with torch.no_grad():
+            train_metrics = evaluate(model, device, train_loader, i, denorm_logger)
+            if hasattr(model, 'regression') and model.regression:
+                logging.info(
+                    f'Epoch {i:03d} (Train) | '
+                    f'Loss: {avg_train_loss:.4f} | '
+                    f'R²: {train_metrics["r2"]:.4f} | '
+                    f'MSE: {train_metrics["mse"]:.4f} | '
+                    f'MAE: {train_metrics["mae"]:.4f} | '
+                    f'LR: {current_lr:.6f}'
+                )
+            else:
+                logging.info(
+                    f'Epoch {i:03d} (Train) | '
+                    f'Loss: {avg_train_loss:.4f} | '
+                    f'Micro-F1: {(train_metrics[0] * 100):.2f} | '
+                    f'Macro-F1: {(train_metrics[2] * 100):.2f} | '
+                    f'AUC: {(train_metrics[1] * 100):.2f} | '
+                    f'LR: {current_lr:.6f}'
+                )
+
+        # Evaluate test metrics
         if (i + 1) % args.test_interval == 0:
-            if hasattr(model, 'regression') and model.regression:
-                # Test soft classification
-                test_metrics = evaluate(model, device, test_loader)
-                logging.info(f'(Test) | Epoch={i:03d}, '
-                            f'MSE={test_metrics["mse"]:.4f}, '
-                            f'MAE={test_metrics["mae"]:.4f}, '
-                            f'R2={test_metrics["r2"]:.4f}')
-            else:
-                # Test original classification
-                test_micro, test_auc, test_macro = evaluate(model, device, test_loader)
-                accs.append(test_micro)
-                aucs.append(test_auc)
-                macros.append(test_macro)
-                text = f'(Train Epoch {i}), test_micro={(test_micro * 100):.2f}, ' \
-                       f'test_macro={(test_macro * 100):.2f}, test_auc={(test_auc * 100):.2f}\n'
-                logging.info(text)
-
-        if args.enable_nni:
-            if hasattr(model, 'regression') and model.regression:
-                # Report all metrics for regression
-                nni.report_intermediate_result({
-                    'default': train_metrics["r2"],  # Primary metric
-                    'r2': train_metrics["r2"],
-                    'mse': train_metrics["mse"],
-                    'mae': train_metrics["mae"]
-                })
-            else:
-                # Report classification metrics
-                nni.report_intermediate_result({
-                    'default': train_auc,
-                    'auc': train_auc,
-                    'micro_f1': train_micro,
-                    'macro_f1': train_macro
-                })
-
+            model.eval()
+            with torch.no_grad():
+                test_metrics = evaluate(model, device, test_loader, i, denorm_logger)
+                
+                if hasattr(model, 'regression') and model.regression:
+                    train_metrics_history.append(train_metrics)
+                    test_metrics_history.append(test_metrics)
+                    
+                    # Compute test loss
+                    test_loss = 0
+                    num_test_batches = 0
+                    for data in test_loader:
+                        data = data.to(device)
+                        pred = model(data)
+                        if args.use_huber:
+                            test_loss += huber_loss(pred.view(-1), data.y.float()).item()
+                        else:
+                            test_loss += F.mse_loss(pred.view(-1), data.y.float()).item()
+                        num_test_batches += 1
+                    avg_test_loss = test_loss / num_test_batches
+                    test_losses.append(avg_test_loss)
+                    
+                    # Log test metrics
+                    logging.info(
+                        f'Epoch {i:03d} (Test) | '
+                        f'Loss: {avg_test_loss:.4f} | '
+                        f'R²: {test_metrics["r2"]:.4f} | '
+                        f'MSE: {test_metrics["mse"]:.4f} | '
+                        f'MAE: {test_metrics["mae"]:.4f}'
+                    )
+                else:
+                    # Compute test loss for classification
+                    test_loss = 0
+                    num_test_batches = 0
+                    for data in test_loader:
+                        data = data.to(device)
+                        out = model(data)
+                        test_loss += F.nll_loss(out, data.y).item()
+                        num_test_batches += 1
+                    avg_test_loss = test_loss / num_test_batches
+                    test_losses.append(avg_test_loss)
+                    
+                    # Log test metrics
+                    logging.info(
+                        f'Epoch {i:03d} (Test) | '
+                        f'Loss: {avg_test_loss:.4f} | '
+                        f'Micro-F1: {(test_metrics[0] * 100):.2f} | '
+                        f'Macro-F1: {(test_metrics[2] * 100):.2f} | '
+                        f'AUC: {(test_metrics[1] * 100):.2f}'
+                    )
+    
     if hasattr(model, 'regression') and model.regression:
-        # Return metrics for soft classification
-        test_metrics = evaluate(model, device, test_loader)
         return test_metrics["mse"], test_metrics["mae"], test_metrics["r2"]
     else:
-        # Return metrics for original classification
-        accs, aucs, macros = np.sort(np.array(accs)), np.sort(np.array(aucs)), np.sort(np.array(macros))
-        return accs.mean(), aucs.mean(), macros.mean()
+        return np.mean(accs), np.mean(aucs), np.mean(macros)
 
 
 @torch.no_grad()
-def evaluate(model, device, loader):
+def evaluate(model, device, loader, epoch=None, denorm_logger=None):
     model.eval()
     
     if hasattr(model, 'regression') and model.regression:
@@ -112,14 +201,23 @@ def evaluate(model, device, loader):
         for data in loader:
             data = data.to(device)
             pred = model(data)
-            # Apply sigmoid to get probabilities for metrics
-            pred = torch.sigmoid(pred)
+            # For regression, we don't need sigmoid
             predictions.append(pred.cpu())
             targets.append(data.y.float().cpu())
         
         predictions = torch.cat(predictions, dim=0).numpy().flatten()
         targets = torch.cat(targets, dim=0).numpy().flatten()
         
+        # Denormalize predictions and targets if dataset has normalization parameters
+        if hasattr(loader.dataset, 'denormalize'):
+            # Store normalized values for verification
+            normalized_predictions = predictions.copy()
+            normalized_targets = targets.copy()
+            
+            # Denormalize
+            predictions = loader.dataset.denormalize(predictions)
+            targets = loader.dataset.denormalize(targets)
+            
         return {
             "mse": metrics.mean_squared_error(targets, predictions),
             "mae": metrics.mean_absolute_error(targets, predictions),

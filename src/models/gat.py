@@ -16,18 +16,19 @@ import pdb
 class MPGATConv(GATConv):
     def __init__(self, in_channels, out_channels, heads, concat: bool = True,
                  negative_slope: float = 0.2, dropout: float = 0.0, bias: bool = True, 
-                 gat_mp_type: str="attention_weighted", edge_attr_size: int=1):
+                 gat_mp_type: str="attention_weighted", num_edge_features: int=None):
         super().__init__(in_channels, out_channels, heads)
 
         self.gat_mp_type = gat_mp_type
         input_dim = out_channels
         if gat_mp_type == "edge_node_concate":
-            input_dim = out_channels*2 + 1
+            input_dim = out_channels*2 + num_edge_features  # Use full edge feature dimension
         elif gat_mp_type == "node_concate":
             input_dim = out_channels*2
         self.edge_lin = torch.nn.Linear(input_dim, out_channels)
         
-        self.edge_transform = torch.nn.Linear(edge_attr_size, 1)
+        # Transform all edge features to a single attention weight
+        self.edge_transform = torch.nn.Linear(num_edge_features, 1) if num_edge_features is not None else None
 
     def message(self, x_i, x_j, alpha_j, alpha_i, edge_attr, index, ptr, size_i):
         alpha = alpha_j if alpha_i is None else alpha_j + alpha_i
@@ -36,8 +37,13 @@ class MPGATConv(GATConv):
         self._alpha = alpha
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
 
-        attention_score = alpha.unsqueeze(-1)  
-        edge_weights = self.edge_transform(edge_attr).unsqueeze(-1)
+        attention_score = alpha.unsqueeze(-1)
+        
+        # Transform edge attributes to attention weights if edge_transform exists
+        if self.edge_transform is not None and edge_attr is not None:
+            edge_weights = self.edge_transform(edge_attr).unsqueeze(-1)
+        else:
+            edge_weights = torch.ones_like(attention_score)
 
         if self.gat_mp_type == "attention_weighted":
             # (1) att: s^(l+1) = s^l * alpha
@@ -73,7 +79,7 @@ class MPGATConv(GATConv):
 
 
 class GAT(torch.nn.Module):
-    def __init__(self, input_dim, args, num_nodes, num_classes=2):
+    def __init__(self, input_dim, args, num_nodes, num_edge_features=None, num_classes=2):
         super().__init__()
         self.activation = torch.nn.ReLU()
         self.convs = torch.nn.ModuleList()
@@ -84,7 +90,6 @@ class GAT(torch.nn.Module):
         hidden_dim = args.hidden_dim
         num_heads = args.num_heads
         num_layers = args.n_GNN_layers
-        edge_emb_dim = args.edge_emb_dim
         gat_mp_type = args.gat_mp_type
         dropout = args.dropout
 
@@ -93,7 +98,7 @@ class GAT(torch.nn.Module):
         for i in range(num_layers-1):
             conv = torch_geometric.nn.Sequential('x, edge_index, edge_attr', [
                 (MPGATConv(gat_input_dim, hidden_dim, heads=num_heads, dropout=dropout,
-                                 gat_mp_type=gat_mp_type, edge_attr_size=args.edge_attr_size),'x, edge_index, edge_attr -> x'),
+                                 gat_mp_type=gat_mp_type, num_edge_features=num_edge_features),'x, edge_index, edge_attr -> x'),
                 nn.Linear(hidden_dim*num_heads, hidden_dim),
                 nn.LeakyReLU(negative_slope=0.2),
                 nn.BatchNorm1d(hidden_dim)
@@ -105,7 +110,7 @@ class GAT(torch.nn.Module):
             node_dim = hidden_dim // 4  # Scale based on hidden_dim
             conv = torch_geometric.nn.Sequential('x, edge_index, edge_attr', [
                 (MPGATConv(hidden_dim, hidden_dim, heads=num_heads, dropout=dropout,
-                                 gat_mp_type=gat_mp_type, edge_attr_size=args.edge_attr_size),'x, edge_index, edge_attr -> x'),
+                                 gat_mp_type=gat_mp_type, num_edge_features=num_edge_features),'x, edge_index, edge_attr -> x'),
                 nn.Linear(hidden_dim*num_heads, hidden_dim),
                 nn.LeakyReLU(negative_slope=0.2),
                 nn.Linear(hidden_dim, node_dim),
@@ -119,7 +124,7 @@ class GAT(torch.nn.Module):
             input_dim = node_dim
             conv = torch_geometric.nn.Sequential('x, edge_index, edge_attr', [
                 (MPGATConv(hidden_dim, hidden_dim, heads=num_heads, dropout=dropout,
-                                 gat_mp_type=gat_mp_type, edge_attr_size=args.edge_attr_size),'x, edge_index, edge_attr -> x'),
+                                 gat_mp_type=gat_mp_type, num_edge_features=num_edge_features),'x, edge_index, edge_attr -> x'),
                 nn.Linear(hidden_dim*num_heads, node_dim),
                 nn.LeakyReLU(negative_slope=0.2),
                 nn.BatchNorm1d(node_dim)
